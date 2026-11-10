@@ -19,11 +19,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
-from self_knowledge_gating.bge_retrieval import BGERetriever
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from self_knowledge_gating.bge_retrieval import ComposableRetriever
 from self_knowledge_gating.conflict import RuleBasedConflictAdjudicator
 from self_knowledge_gating.llm import QwenAnswerer
 from self_knowledge_gating.pipeline import SelfKnowledgeGatingPipeline
@@ -32,11 +36,14 @@ from self_knowledge_gating.probes import PROBE_POINTS, ProbeRecorder
 from self_knowledge_gating.schemas import Evidence, Question
 from self_knowledge_gating.signals import ProbeSignalEstimator
 from self_knowledge_gating.verification import EmbeddingEvidenceVerifier
+from baselines import build_conflict_adjudicator, build_policy
 
 ROOT = "/root/autodl-tmp/self-knowledge-gating"
 MODELS = f"{ROOT}/models/modelscope/models"
-FT_ENCODER = f"{ROOT}/models/finetuned/bge-m3-matsci-v1"
-RERANKER = f"{MODELS}/BAAI--bge-reranker-v2-m3/snapshots/master"
+FT_ENCODER = os.environ.get("RAG_ENCODER_PATH", f"{ROOT}/models/finetuned/bge-m3-matsci-v1-seed42")
+RERANKER = os.environ.get("RAG_RERANKER_PATH", f"{ROOT}/models/finetuned/bge-reranker-v2-m3-matsci-v1-seed42")
+ENCODER_TYPE = os.environ.get("RAG_ENCODER_TYPE", "flag_embedding")
+RERANKER_TYPE = os.environ.get("RAG_RERANKER_TYPE", "flag_embedding")
 LLM = f"{MODELS}/Qwen--Qwen3-8B/snapshots/master"
 INTERIM = f"{ROOT}/data/interim/openalex_clean.jsonl"
 TEST_PAIRS = f"{ROOT}/data/processed/pairs_test.jsonl"
@@ -103,6 +110,31 @@ def make_questions(answerer: QwenAnswerer, n: int) -> list[Question]:
     return out
 
 
+def make_boundary_questions(path: str, n: int) -> list[Question]:
+    """Load controlled boundary rows without exposing expected labels to prompts."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            rows.append(json.loads(line))
+    rows = rows[:n]
+    return [
+        Question(
+            text=row["question"],
+            question_id=row["sample_id"],
+            metadata={
+                "source_work_id": row.get("source_work_id"),
+                "venue": row.get("venue"),
+                "year": row.get("year"),
+                "expected_boundary_state": row["boundary_state"],
+                "access_condition": row["access_condition"],
+                "freshness_condition": row["freshness_condition"],
+                "matched_group_id": row.get("matched_group_id"),
+            },
+        )
+        for row in rows
+    ]
+
+
 def serialize_result(qid: str, result) -> dict[str, Any]:
     return {
         "question_id": qid,
@@ -128,9 +160,16 @@ def main() -> None:
     ap.add_argument("--corpus", type=int, default=8000)
     ap.add_argument("--hidden-states", action="store_true")
     ap.add_argument("--run-id", default=None)
+    ap.add_argument("--routing-baseline", default="calibrated-boundary-gate")
+    ap.add_argument("--conflict-baseline", default="claim-level")
+    ap.add_argument("--conformal-risk-target", type=float, default=0.05)
+    ap.add_argument("--boundary-benchmark", default=None)
     args = ap.parse_args()
 
-    run_id = args.run_id or time.strftime("e2e-%Y%m%d-%H%M%S")
+    run_id = args.run_id or (
+        f"e2e-{args.routing_baseline}-{args.conflict_baseline}-"
+        + time.strftime("%Y%m%d-%H%M%S")
+    )
     run_dir = f"{ROOT}/results/runs/{run_id}"
     recorder = ProbeRecorder(run_dir)
     print("run_dir:", run_dir, flush=True)
@@ -139,10 +178,32 @@ def main() -> None:
     corpus = load_corpus(args.corpus)
     print(f"corpus: {len(corpus)} evidence docs", flush=True)
 
-    retriever = BGERetriever(
-        encoder_path=FT_ENCODER, reranker_path=RERANKER, corpus=corpus,
-        candidate_top_k=40, final_top_k=5, batch_size=16, max_length=512,
-        use_fp16=True)
+    encoder_options = {"name": FT_ENCODER}
+    reranker_options = {"name": RERANKER}
+    if ENCODER_TYPE.casefold().replace("-", "_") in {"flag_embedding", "flag", "bge_m3"}:
+        encoder_options["use_fp16"] = True
+    else:
+        encoder_options.update({"device": "auto", "precision": "auto", "pooling": "cls"})
+    if RERANKER_TYPE.casefold().replace("-", "_") in {"flag_embedding", "flag", "bge_reranker"}:
+        reranker_options["use_fp16"] = True
+    else:
+        reranker_options.update({"device": "auto", "precision": "auto"})
+
+    retriever = ComposableRetriever.from_model_paths(
+        encoder_path=FT_ENCODER,
+        reranker_path=RERANKER,
+        encoder_type=ENCODER_TYPE,
+        reranker_type=RERANKER_TYPE,
+        encoder_options=encoder_options,
+        reranker_options=reranker_options,
+        corpus=corpus,
+        candidate_top_k=40,
+        final_top_k=5,
+        encoder_batch_size=16,
+        reranker_batch_size=8,
+        encoder_max_length=512,
+        reranker_max_length=512,
+    )
     answerer = QwenAnswerer(LLM, recorder=recorder,
                             hidden_states=args.hidden_states)
     print(f"models loaded in {time.time()-t0:.0f}s", flush=True)
@@ -163,13 +224,24 @@ def main() -> None:
     estimator = ProbeSignalEstimator(probe_fn)
     verifier = EmbeddingEvidenceVerifier(
         FT_ENCODER, threshold=0.55, recorder=recorder)
+    policy_kwargs = {}
+    if args.routing_baseline == "conformal-abstention":
+        policy_kwargs["risk_target"] = args.conformal_risk_target
+    policy = build_policy(args.routing_baseline, **policy_kwargs)
+    if args.conflict_baseline != "claim-level":
+        policy.allow_resolved_conflict = True
     pipeline = SelfKnowledgeGatingPipeline(
         retriever=retriever, signal_estimator=estimator,
         answerer=answerer, verifier=verifier,
-        adjudicator=RuleBasedConflictAdjudicator(), policy=GatePolicy(),
+        adjudicator=build_conflict_adjudicator(args.conflict_baseline),
+        policy=policy,
         top_k=5)
 
-    questions = make_questions(answerer, args.n)
+    questions = (
+        make_boundary_questions(args.boundary_benchmark, args.n)
+        if args.boundary_benchmark
+        else make_questions(answerer, args.n)
+    )
     print(f"questions: {len(questions)}", flush=True)
 
     results_path = os.path.join(run_dir, "results.jsonl")
@@ -185,6 +257,10 @@ def main() -> None:
                 "source_work_id": question.metadata["source_work_id"],
                 "venue": question.metadata["venue"],
                 "year": question.metadata["year"],
+                "expected_boundary_state": question.metadata.get("expected_boundary_state"),
+                "access_condition": question.metadata.get("access_condition"),
+                "freshness_condition": question.metadata.get("freshness_condition"),
+                "matched_group_id": question.metadata.get("matched_group_id"),
             })
             # pre-run probes so 'signals' probe sees the same pass
             probe_fn(question)
@@ -254,6 +330,17 @@ def main() -> None:
         "probe_records": recorder.records,
         "wall_time_s": round(time.time() - t0, 1),
         "models": {"encoder": FT_ENCODER, "reranker": RERANKER, "llm": LLM},
+        "routing_baseline": args.routing_baseline,
+        "conflict_baseline": args.conflict_baseline,
+        "boundary_benchmark": args.boundary_benchmark,
+        "resource_budget": {
+            "candidate_top_k": 40,
+            "final_top_k": 5,
+            "encoder_batch_size": 16,
+            "reranker_batch_size": 8,
+            "encoder_max_length": 512,
+            "reranker_max_length": 512,
+        },
     }
     with open(os.path.join(run_dir, "summary.json"), "w",
               encoding="utf-8") as f:

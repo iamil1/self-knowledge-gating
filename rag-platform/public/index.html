@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>材料科学 RAG 门控对话</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #0f141b; color: #e6e9ef; height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 20px; border-bottom: 1px solid #232b36;
+    display: flex; align-items: center; gap: 12px;
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .badge {
+    font-size: 12px; padding: 2px 10px; border-radius: 999px;
+    background: #1d2733; color: #8ab4f8; border: 1px solid #2c3a4d;
+  }
+  .badge.ok { color: #7ee2a8; border-color: #2c4d3a; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px; max-width: 900px;
+    width: 100%; margin: 0 auto; }
+  .msg { margin-bottom: 18px; }
+  .msg .role { font-size: 12px; color: #7a8699; margin-bottom: 6px; }
+  .msg.user .bubble {
+    background: #1c2b3a; border-radius: 12px 12px 12px 2px;
+    padding: 10px 14px; display: inline-block; max-width: 85%;
+  }
+  .msg.assistant .bubble {
+    background: #16202c; border: 1px solid #232f3e;
+    border-radius: 12px 12px 2px 12px; padding: 12px 16px;
+  }
+  .meta { margin-top: 10px; font-size: 12px; color: #8b98ab;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .tag { padding: 1px 8px; border-radius: 4px; font-size: 11px; }
+  .tag.answer { background: #14351f; color: #7ee2a8; }
+  .tag.abstain { background: #3a2314; color: #f0b57a; }
+  .tag.route { background: #1b2a44; color: #8ab4f8; }
+  .claims { margin-top: 8px; font-size: 12px; color: #9fb0c5; }
+  .claims li { margin: 3px 0 3px 18px; }
+  .evidence { margin-top: 10px; }
+  .ev-item { border-left: 3px solid #2f6fbd; padding: 6px 10px;
+    margin: 6px 0; background: #121a24; font-size: 12px; }
+  .ev-item .t { color: #a8c7fa; }
+  .ev-item .s { color: #77879c; margin-top: 3px; }
+  .ev-item .score { color: #5f7186; font-size: 11px; }
+  .sys { color: #f0b57a; font-size: 13px; margin-bottom: 8px; }
+  #input-bar {
+    border-top: 1px solid #232b36; padding: 12px 20px;
+    display: flex; gap: 10px; max-width: 900px; width: 100%;
+    margin: 0 auto;
+  }
+  #q { flex: 1; background: #16202c; border: 1px solid #2a3646;
+    border-radius: 8px; color: #e6e9ef; padding: 12px 14px; font-size: 14px; }
+  #q:focus { outline: none; border-color: #2f6fbd; }
+  #send { background: #2f6fbd; color: #fff; border: none;
+    border-radius: 8px; padding: 0 22px; cursor: pointer; font-size: 14px; }
+  #send:disabled { opacity: 0.5; cursor: default; }
+  .spinner { color: #7a8699; font-size: 13px; padding: 4px 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>材料科学 RAG · 自我知识门控对话</h1>
+  <span id="conn" class="badge">连接中…</span>
+</header>
+<div id="chat"></div>
+<div id="input-bar">
+  <input id="q" placeholder="输入材料科学问题，例如：halide perovskite 太阳能电池的带隙报道值是多少？" autofocus>
+  <button id="send">发送</button>
+</div>
+<script>
+const chat = document.getElementById("chat");
+const q = document.getElementById("q");
+const sendBtn = document.getElementById("send");
+const conn = document.getElementById("conn");
+
+fetch("/api/status").then(r => r.json()).then(s => {
+  conn.textContent = s.tunnel ? "SSH 隧道已连接 " + s.ssh : "隧道未就绪";
+  conn.classList.toggle("ok", !!s.tunnel);
+}).catch(() => { conn.textContent = "状态查询失败"; });
+
+function esc(s) { const d = document.createElement("div");
+  d.textContent = s == null ? "" : s; return d.innerHTML; }
+
+function addMsg(role, html) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.innerHTML = `<div class="role">${role === "user" ? "你" : "门控系统"}</div>
+    <div class="bubble">${html}</div>`;
+  chat.appendChild(div); chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function renderAssistant(d) {
+  let html = "";
+  if (d.outcome === "answer" && d.answer) {
+    html += `<div>${esc(d.answer)}</div>`;
+    if (d.partial_answer) {
+      html += `<div class="sys" style="margin-top:8px">仅展示当前证据直接支持的内容，其余内容未确认。</div>`;
+    }
+  } else {
+    html += `<div class="sys">系统选择拒答（${esc(d.reason_code || "UNKNOWN")}）。`
+      + `下方为检索到的相关文献，供你自行判断。</div>`;
+    if (d.parametric_answer || d.grounded_answer) {
+      html += `<div class="claims">`
+        + (d.parametric_answer ? `<div><b>模型参数记忆答案：</b>${esc(d.parametric_answer)}</div>` : "")
+        + (d.grounded_answer ? `<div style="margin-top:4px"><b>证据支撑答案：</b>${esc(d.grounded_answer)}</div>` : "")
+        + `</div>`;
+    }
+  }
+  const tags = [];
+  tags.push(`<span class="tag route">route: ${esc(d.route)}</span>`);
+  tags.push(`<span class="tag ${d.outcome}">${esc(d.outcome)}</span>`);
+  if (d.reason_code) tags.push(`<span class="tag route">${esc(d.reason_code)}</span>`);
+  if (d.self_knowledge != null)
+    tags.push(`<span class="tag route">self_knowledge ${d.self_knowledge.toFixed(2)}</span>`);
+  if (d.verification)
+    tags.push(`<span class="tag route">证据支持 ${d.verification.supported_claims}/${d.verification.total_claims}</span>`);
+  tags.push(`<span class="tag route">${(d.latency_ms / 1000).toFixed(1)}s</span>`);
+  html += `<div class="meta">${tags.join("")}</div>`;
+  if (d.boundary_probs) {
+    const items = Object.entries(d.boundary_probs)
+      .map(([k, v]) => `${k} ${(v * 100).toFixed(0)}%`).join(" · ");
+    html += `<div class="meta" style="margin-top:4px">${esc(items)}</div>`;
+  }
+  if (d.evidence && d.evidence.length) {
+    html += `<div class="evidence">` + d.evidence.map(e => `
+      <div class="ev-item">
+        <div class="t">${esc(e.title)} <span class="score">[${esc(e.venue)} ${e.year ?? ""} · rerank ${(e.reranker_score ?? 0).toFixed(3)}]</span></div>
+        <div class="s">${esc(e.snippet)}…</div>
+      </div>`).join("") + `</div>`;
+  }
+  return html;
+}
+
+async function ask() {
+  const question = q.value.trim();
+  if (!question) return;
+  q.value = ""; sendBtn.disabled = true;
+  addMsg("user", esc(question));
+  const wait = addMsg("assistant", `<span class="spinner">检索 + 生成 + 验证中（约 15–30 秒）…</span>`);
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const d = await r.json();
+    if (d.error) wait.querySelector(".bubble").innerHTML = `<span class="sys">出错：${esc(d.error)}</span>`;
+    else wait.querySelector(".bubble").innerHTML = renderAssistant(d);
+  } catch (e) {
+    wait.querySelector(".bubble").innerHTML = `<span class="sys">请求失败：${esc(String(e))}</span>`;
+  }
+  sendBtn.disabled = false; chat.scrollTop = chat.scrollHeight;
+}
+
+sendBtn.onclick = ask;
+q.onkeydown = (e) => { if (e.key === "Enter") ask(); };
+</script>
+</body>
+</html>

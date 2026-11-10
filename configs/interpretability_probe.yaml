@@ -1,0 +1,43 @@
+config_version: 1
+
+run:
+  id: boundary-probes-seed42
+  seed: 42
+  n_base_questions: 300
+  output_benchmark: data/processed/boundary_benchmark_seed42.jsonl
+  output_analysis: results/runs/boundary-probes-seed42/probe_analysis.json
+
+data:
+  source_pairs: data/processed/pairs_test.jsonl
+  source_manifest: data/processed/manifest.json
+
+states:
+  - parametric_known
+  - uncertain
+  - no_access
+  - stale
+
+interventions:
+  parametric_known:
+    access_condition: public
+    freshness_condition: current
+    expected_actions: [answer]
+  uncertain:
+    access_condition: public
+    freshness_condition: current
+    expected_actions: [retrieve, abstain]
+  no_access:
+    access_condition: permission_denied
+    freshness_condition: current
+    expected_actions: [abstain]
+  stale:
+    access_condition: public
+    freshness_condition: stale_parameter
+    expected_actions: [retrieve, abstain]
+
+probe:
+  entropy_samples: 4
+  temperature: 0.8
+  hidden_states: false
+  same_prompt: true
+  same_model: true

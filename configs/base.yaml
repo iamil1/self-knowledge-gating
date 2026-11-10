@@ -36,16 +36,24 @@ retrieval:
   provider: modelscope
   offline: true
   dense_encoder:
+    type: flag_embedding
     model_id: BAAI/bge-m3
     local_dir: replace-with-download-output
     revision: replace-with-snapshot-revision
     normalize_embeddings: true
+    device: auto
+    precision: auto
+    pooling: cls
+    query_prefix: ""
     max_length: 8192
     batch_size: 16
   reranker:
+    type: flag_embedding
     model_id: BAAI/bge-reranker-v2-m3
     local_dir: replace-with-download-output
     revision: replace-with-snapshot-revision
+    device: auto
+    precision: auto
     max_length: 512
     batch_size: 8
   candidate_top_k: 100

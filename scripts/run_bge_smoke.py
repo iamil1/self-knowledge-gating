@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from self_knowledge_gating.bge_retrieval import BGERetriever
+from self_knowledge_gating.bge_retrieval import ComposableRetriever
 from self_knowledge_gating.conflict import RuleBasedConflictAdjudicator
 from self_knowledge_gating.generation import MetadataAnswerer
 from self_knowledge_gating.pipeline import SelfKnowledgeGatingPipeline
@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--encoder-path", required=True)
     parser.add_argument("--reranker-path", required=True)
+    parser.add_argument("--encoder-type", default="flag_embedding")
+    parser.add_argument("--reranker-type", default="flag_embedding")
     parser.add_argument("--output", type=Path, default=Path("results/runs/bge-smoke.json"))
     return parser.parse_args()
 
@@ -62,15 +64,28 @@ def main() -> None:
             source_version="demo-v1",
         ),
     )
-    retriever = BGERetriever(
+    encoder_options = {"name": args.encoder_path}
+    reranker_options = {"name": args.reranker_path}
+    if args.encoder_type.casefold().replace("-", "_") in {"flag_embedding", "flag", "bge_m3"}:
+        encoder_options["use_fp16"] = True
+    else:
+        encoder_options.update({"device": "auto", "precision": "auto", "pooling": "cls"})
+    if args.reranker_type.casefold().replace("-", "_") in {"flag_embedding", "flag", "bge_reranker"}:
+        reranker_options["use_fp16"] = True
+    else:
+        reranker_options.update({"device": "auto", "precision": "auto"})
+    retriever = ComposableRetriever.from_model_paths(
         encoder_path=args.encoder_path,
         reranker_path=args.reranker_path,
+        encoder_type=args.encoder_type,
+        reranker_type=args.reranker_type,
+        encoder_options=encoder_options,
+        reranker_options=reranker_options,
         corpus=corpus,
         candidate_top_k=3,
         final_top_k=3,
         batch_size=4,
         max_length=512,
-        use_fp16=True,
     )
     pipeline = SelfKnowledgeGatingPipeline(
         signal_estimator=MetadataSignalEstimator(),

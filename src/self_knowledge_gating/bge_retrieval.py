@@ -1,7 +1,8 @@
-"""BGE-M3 dense retrieval with BGE reranking.
+"""Composable dense retrieval and reranking pipeline.
 
-The optional imports stay inside the constructor so the core pipeline remains
-usable without the retrieval extra installed.
+``ComposableRetriever`` accepts any objects implementing the encoder and
+reranker protocols. ``BGERetriever`` remains as a backwards-compatible
+convenience wrapper for the default FlagEmbedding BGE pair.
 """
 
 from __future__ import annotations
@@ -11,21 +12,28 @@ from typing import Sequence
 
 import numpy as np
 
+from .retrieval_components import (
+    DenseEncoder,
+    PairReranker,
+    build_encoder,
+    build_reranker,
+)
 from .schemas import Evidence, Question
 
 
 @dataclass
-class BGERetriever:
-    """Local, offline BGE-M3 plus bge-reranker-v2-m3 retriever."""
+class ComposableRetriever:
+    """Retrieve with one encoder and rerank with an independent component."""
 
-    encoder_path: str
-    reranker_path: str
+    encoder: DenseEncoder
+    reranker: PairReranker
     corpus: Sequence[Evidence]
     candidate_top_k: int = 100
     final_top_k: int = 20
-    batch_size: int = 16
-    max_length: int = 8192
-    use_fp16: bool = True
+    encoder_batch_size: int = 16
+    reranker_batch_size: int = 8
+    encoder_max_length: int = 8192
+    reranker_max_length: int = 512
     normalize_embeddings: bool = True
 
     def __post_init__(self) -> None:
@@ -33,18 +41,34 @@ class BGERetriever:
             raise ValueError("candidate_top_k and final_top_k must be positive")
         if self.final_top_k > self.candidate_top_k:
             raise ValueError("final_top_k cannot exceed candidate_top_k")
-        if self.batch_size <= 0 or self.max_length <= 0:
-            raise ValueError("batch_size and max_length must be positive")
-        try:
-            from FlagEmbedding import BGEM3FlagModel, FlagReranker
-        except ImportError as exc:
-            raise RuntimeError(
-                "BGERetriever requires the retrieval extra: pip install -e '.[retrieval]'"
-            ) from exc
-
-        self._encoder = BGEM3FlagModel(self.encoder_path, use_fp16=self.use_fp16)
-        self._reranker = FlagReranker(self.reranker_path, use_fp16=self.use_fp16)
+        if self.encoder_batch_size <= 0 or self.reranker_batch_size <= 0:
+            raise ValueError("batch sizes must be positive")
         self._doc_embeddings: np.ndarray | None = None
+
+    @classmethod
+    def from_model_paths(
+        cls,
+        *,
+        encoder_path: str,
+        reranker_path: str,
+        corpus: Sequence[Evidence],
+        encoder_type: str = "flag_embedding",
+        reranker_type: str = "flag_embedding",
+        encoder_options: dict | None = None,
+        reranker_options: dict | None = None,
+        **kwargs,
+    ) -> "ComposableRetriever":
+        encoder = build_encoder(
+            encoder_type,
+            encoder_path,
+            **(encoder_options or {}),
+        )
+        reranker = build_reranker(
+            reranker_type,
+            reranker_path,
+            **(reranker_options or {}),
+        )
+        return cls(encoder=encoder, reranker=reranker, corpus=corpus, **kwargs)
 
     def search(self, question: Question, top_k: int = 5) -> Sequence[Evidence]:
         if not self.corpus:
@@ -53,13 +77,21 @@ class BGERetriever:
         if requested_k <= 0:
             return ()
         self._ensure_index()
-        query_embedding = self._encode([question.text])[0]
+        query_embedding = self._encode([question.text], is_query=True)[0]
         dense_scores = self._doc_embeddings @ query_embedding  # type: ignore[operator]
         candidate_k = min(self.candidate_top_k, len(self.corpus))
         candidate_indices = np.argsort(-dense_scores)[:candidate_k]
-        pairs = [[question.text, self.corpus[index].text] for index in candidate_indices]
-        rerank_scores = self._reranker.compute_score(pairs, normalize=True)
-        rerank_scores = np.asarray(rerank_scores, dtype=np.float32).reshape(-1)
+        candidate_texts = [self.corpus[index].text for index in candidate_indices]
+        rerank_scores = self.reranker.score(
+            question.text,
+            candidate_texts,
+            batch_size=self.reranker_batch_size,
+            max_length=self.reranker_max_length,
+        )
+        if len(rerank_scores) != len(candidate_indices):
+            raise ValueError(
+                "reranker returned a different number of scores than candidate passages"
+            )
 
         ranked = sorted(
             zip(candidate_indices.tolist(), rerank_scores.tolist()),
@@ -74,8 +106,8 @@ class BGERetriever:
                 {
                     "dense_score": float(dense_scores[index]),
                     "reranker_score": float(rerank_score),
-                    "retrieval_encoder": "BAAI/bge-m3",
-                    "retrieval_reranker": "BAAI/bge-reranker-v2-m3",
+                    "retrieval_encoder": getattr(self.encoder, "name", type(self.encoder).__name__),
+                    "retrieval_reranker": getattr(self.reranker, "name", type(self.reranker).__name__),
                 }
             )
             results.append(
@@ -91,14 +123,59 @@ class BGERetriever:
         if self._doc_embeddings is None:
             self._doc_embeddings = self._encode([item.text for item in self.corpus])
 
-    def _encode(self, texts: Sequence[str]) -> np.ndarray:
-        encoded = self._encoder.encode(
-            list(texts),
-            batch_size=self.batch_size,
-            max_length=self.max_length,
+    def _encode(self, texts: Sequence[str], *, is_query: bool = False) -> np.ndarray:
+        vectors = self.encoder.encode(
+            texts,
+            batch_size=self.encoder_batch_size,
+            max_length=self.encoder_max_length,
+            is_query=is_query,
         )
-        vectors = np.asarray(encoded["dense_vecs"], dtype=np.float32)
+        vectors = np.asarray(vectors, dtype=np.float32)
         if self.normalize_embeddings:
             norms = np.linalg.norm(vectors, axis=1, keepdims=True)
             vectors = vectors / np.clip(norms, 1e-12, None)
         return vectors
+
+
+class BGERetriever(ComposableRetriever):
+    """Backwards-compatible default BGE-M3 plus BGE reranker adapter."""
+
+    def __init__(
+        self,
+        encoder_path: str,
+        reranker_path: str,
+        corpus: Sequence[Evidence],
+        candidate_top_k: int = 100,
+        final_top_k: int = 20,
+        batch_size: int = 16,
+        max_length: int = 8192,
+        use_fp16: bool = True,
+        normalize_embeddings: bool = True,
+        reranker_batch_size: int | None = None,
+        reranker_max_length: int = 512,
+    ) -> None:
+        encoder = build_encoder(
+            "flag_embedding",
+            encoder_path,
+            use_fp16=use_fp16,
+            normalize_embeddings=normalize_embeddings,
+            name=encoder_path,
+        )
+        reranker = build_reranker(
+            "flag_embedding",
+            reranker_path,
+            use_fp16=use_fp16,
+            name=reranker_path,
+        )
+        super().__init__(
+            encoder=encoder,
+            reranker=reranker,
+            corpus=corpus,
+            candidate_top_k=candidate_top_k,
+            final_top_k=final_top_k,
+            encoder_batch_size=batch_size,
+            reranker_batch_size=reranker_batch_size or batch_size,
+            encoder_max_length=max_length,
+            reranker_max_length=reranker_max_length,
+            normalize_embeddings=normalize_embeddings,
+        )

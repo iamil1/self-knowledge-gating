@@ -39,8 +39,10 @@ class GatePolicy:
 
     def __init__(self, thresholds: GateThresholds | None = None) -> None:
         self.thresholds = thresholds or GateThresholds()
+        self.allow_resolved_conflict = False
 
-    def route(self, signals: BoundarySignals) -> PolicyDecision:
+    def route(self, signals: BoundarySignals, question=None) -> PolicyDecision:
+        del question
         if signals.ambiguity >= self.thresholds.ambiguity:
             return PolicyDecision(Action.CLARIFY, ReasonCode.AMBIGUOUS_QUESTION)
         if (
@@ -74,6 +76,8 @@ class GatePolicy:
             conflict.status == "none" and conflict.score >= self.thresholds.conflict_score
         ):
             return PolicyDecision(Action.ABSTAIN, ReasonCode.CONFLICT_UNRESOLVED)
+        if conflict.status == "resolved" and self.allow_resolved_conflict:
+            return PolicyDecision(Action.ANSWER)
         if verification.evidence_sufficiency < self.thresholds.evidence_sufficiency:
             return PolicyDecision(Action.ABSTAIN, ReasonCode.INSUFFICIENT_EVIDENCE)
         return PolicyDecision(Action.ANSWER)

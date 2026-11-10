@@ -27,7 +27,10 @@ PROBE_POINTS: dict[str, dict[str, Any]] = {
         "when": "before pipeline.run",
         "version": 1,
         "shape": {"question_id": "str", "question_text": "str",
-                  "source_work_id": "str", "venue": "str", "year": "int"},
+                  "source_work_id": "str|null", "venue": "str|null",
+                  "year": "int|null", "expected_boundary_state": "str|null",
+                  "access_condition": "str|null", "freshness_condition": "str|null",
+                  "matched_group_id": "str|null"},
     },
     "p_ik": {
         "producer": "llm.QwenAnswerer.probe_self_knowledge",
@@ -80,6 +83,14 @@ PROBE_POINTS: dict[str, dict[str, Any]] = {
         "shape": {"mode": "parametric|grounded", "text": "str",
                   "mean_logprob": "float", "min_logprob": "float",
                   "n_tokens": "int", "latency_ms": "float"},
+    },
+    "grounded_revision": {
+        "producer": "llm.QwenAnswerer.revise_grounded",
+        "when": "after evidence verification fails and before final gate",
+        "version": 1,
+        "shape": {"text": "str", "mean_logprob": "float",
+                  "min_logprob": "float", "n_tokens": "int",
+                  "latency_ms": "float", "removed_claims": ["str"]},
     },
     "claim_extraction": {
         "producer": "llm.QwenAnswerer._extract_claims",

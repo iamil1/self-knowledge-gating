@@ -42,3 +42,8 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Local web client dependencies, credentials and logs
+rag-platform/node_modules/
+rag-platform/config.local.json
+rag-platform/server-test.log

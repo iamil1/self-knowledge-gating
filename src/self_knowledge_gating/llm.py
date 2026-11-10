@@ -25,6 +25,15 @@ SYS_PROMPT = (
     "the information you actually have; do not invent numeric values, and keep "
     "the answer to at most three sentences."
 )
+REVISION_PROMPT = (
+    "Rewrite the draft answer using only claims directly supported by the "
+    "evidence below. Remove unsupported examples, numbers, categories, and "
+    "inferences. Keep the user's language, answer the question briefly, and "
+    "say that the evidence is insufficient only when no supported answer can "
+    "be formed. Cite evidence ids in brackets.\n\n"
+    "Evidence:\n{evidence}\n\nQuestion: {question}\n\n"
+    "Draft answer:\n{draft}\n\nRevised answer:"
+)
 CLAIM_PROMPT = (
     "Extract the atomic factual claims of the following answer as JSON: a list "
     "of objects with keys \"key\" (short property name, e.g. band_gap), "
@@ -90,6 +99,30 @@ class QwenAnswerer(Answerer):
             self.recorder.record(question.question_id or "?", "generation",
                                  {"mode": mode, **gen_probe})
         claims = self._extract_claims(question, text, mode)
+        return Answer(text=text, claims=tuple(claims))
+
+    def revise_grounded(self, question: Question, draft: Answer,
+                        evidence: Sequence[Evidence], verification) -> Answer:
+        """Remove unsupported draft claims before the final gate decision."""
+        context = "\n\n".join(
+            f"[{item.evidence_id}] {item.text}" for item in evidence
+        )
+        unsupported = ", ".join(verification.unsupported_claims) or "the unsupported parts"
+        prompt = REVISION_PROMPT.format(
+            evidence=context,
+            question=question.text,
+            draft=(
+                f"{draft.text}\n\nUnsupported claim keys to remove: {unsupported}"
+            ),
+        )
+        text, probe = self._chat(prompt, greedy=True)
+        if self.recorder is not None:
+            self.recorder.record(
+                question.question_id or "?",
+                "grounded_revision",
+                {"text": text, **probe, "removed_claims": list(verification.unsupported_claims)},
+            )
+        claims = self._extract_claims(question, text, "grounded_revision")
         return Answer(text=text, claims=tuple(claims))
 
     # ---------- probes ----------

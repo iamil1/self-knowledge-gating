@@ -91,6 +91,88 @@ flowchart LR
 - **H4：冲突行为受先验重叠影响。** 模型可能出现确认偏差、可得性偏差和多数规则；显式声明级裁决应降低这种不对称。
 - **H5：拒答是选择性决策。** 统一阈值容易在权限拒绝场景泄露、在干净样本上过度拒答；reason-coded 策略应改善条件风险-覆盖率前沿。
 
+## 5.1 可解释性机制分析计划
+
+可解释性是本项目的主线。RAG、拒答和冲突裁决是干预环境，用来观察知识边界信号如何形成、如何影响决策，以及局部信号是否最终改善系统可靠性。研究不把一个高 AUROC 的 probe 直接当作机制解释，而是要求完成“预测、定位、干预、系统验证”四步。
+
+### 五级分析框架
+
+| 层级 | 观察/方法 | 要回答的问题 | 最低验证 |
+| --- | --- | --- | --- |
+| 信号层 | `P(IK)`、`P(True)`、semantic entropy、sampling consistency、log probability | 哪些信号能预测正确性、幻觉和检索收益？ | AUROC、ECE、Brier、slice calibration、OOD |
+| 表示层 | hidden states、attention、layer/token probe、Tuned Lens | 不确定性和边界信息在哪些层、token 和表示方向形成？ | 跨层、跨任务、跨模型 probe transfer |
+| 因果层 | activation patching、layer/neuron ablation、steering、counterfactual intervention | 改变该表示是否会改变 known/uncertain、检索和拒答行为？ | intervention effect、方向翻转、控制变量实验 |
+| 训练动态层 | gradient norm、gradient cosine、update direction、Fisher/参数重要性、loss/gradient variance | 微调和校准如何改变边界信号，哪些更新造成泛化或退化？ | seed=42 训练轨迹、更新前后信号和 OOD 对比 |
+| 系统层 | gate、retrieval、reranker、evidence verifier、conflict adjudicator、LLM 输出 | 局部信号是否改善 coverage-risk-cost-latency frontier？ | 四组合、预算匹配、失败归因和 Pareto frontier |
+
+第一阶段的可复现实验入口：
+
+```powershell
+python scripts/build_boundary_benchmark.py `
+  --config configs/interpretability_probe.yaml
+
+python scripts/run_e2e.py --n 1200 --corpus 8000 `
+  --boundary-benchmark data/processed/boundary_benchmark_seed42.jsonl `
+  --routing-baseline calibrated-boundary-gate `
+  --conflict-baseline claim-level `
+  --run-id boundary-probes-seed42
+
+python scripts/analyze_probe_runs.py `
+  --run-dir results/runs/boundary-probes-seed42 `
+  --benchmark data/processed/boundary_benchmark_seed42.jsonl
+```
+
+第一阶段只回答信号层问题：四类状态的 probe 分布、校准和路由差异。期望状态只进入事后分析，不进入模型 prompt；因此 `no_access` 和 `stale` 的可分性会被诚实地测出来，而不是由 metadata 泄漏。
+
+当前列表中的 `P(IK)`、`P(True)`、语义熵、采样一致性、logprob 和 hidden states 足够作为**信号层起点**，但不能单独支撑机制解释。表示层必须加入 layer/token 分析；因果层必须加入 activation patching 或 ablation；训练动态层作为微调和校准的解释工具，不把梯度直接当成单次推理的知识边界信号。
+
+### 四类边界的受控干预
+
+每类边界都要用同一问题或匹配问题做最小干预，避免把主题差异误当成机制差异：
+
+1. `parametric_known`：常见材料属性，闭卷答案正确，与当前参考版本一致。
+2. `uncertain`：长尾但可访问的问题，改变采样、提示和上下文长度，测量信号稳定性。
+3. `no_access`：权威答案存在，但撤销唯一授权来源；问题文本、模型和其他条件保持不变。
+4. `stale`：固定旧模型或旧数据快照，替换当前权威版本，形成时间冲突。
+
+关键对照是：`no_access` 不应只表现为普通 uncertainty，`stale` 也不应只依赖模型主观置信度。边界分类必须报告混淆矩阵、AUROC、ECE、slice risk 和 reason-code 一致性。
+
+### 因果解释与训练动态的边界
+
+内部 probe 的相关性不能证明机制。对高贡献 layer/token/方向做干预后，需要重新运行同一问题的 probe、gate 和最终回答；如果只改变 probe 输出而不改变模型行为，应标记为不可解释的相关信号。
+
+梯度和优化器轨迹用于解释训练过程：记录 layer-wise gradient norm、参数更新余弦、Fisher 或近似重要性、probe loss 与主任务 loss 的关系，并比较微调前后 `known/uncertain/stale` 的迁移。梯度分析不作为线上 `answer/retrieve/abstain` 的唯一输入，因为线上推理通常没有反向传播。
+
+### 全局动态与“混沌”表述
+
+目前把系统视为随机、非平稳、路径依赖的决策系统，而不预先称为混沌系统。先测量：
+
+- prompt 改写敏感性；
+- temperature 和采样敏感性；
+- context 顺序、证据位置和文档数量敏感性；
+- evidence relevance/freshness/conflict 干预；
+- checkpoint 或知识版本漂移；
+- repeated-run variance 和边界 hysteresis。
+
+只有在小扰动产生可重复的非线性放大，并排除采样噪声和阈值伪影后，才讨论动力系统或混沌性质。主论文先使用“非平稳性、敏感性和路径依赖”这些可检验术语。
+
+### 机制研究的成功与失败判据
+
+- **成功**：信号在跨任务/OOD 上保持校准；关键表示干预能改变边界判断；干预后的动作变化与最终风险变化一致；系统 frontier 在相同预算下改善。
+- **部分成功**：信号能预测错误但不能通过干预改变行为，归类为诊断性 probe，不称为因果机制。
+- **失败**：只在同分布数据上有效、对 prompt 或模型轻微变化失效、能被内部信号 camouflage，或只改善拒答率而导致 coverage 崩溃。
+- **系统性风险**：CORVUS 类 camouflage 说明单一内部 detector 不足，必须与外部证据、跨模型信号和 claim-level verification 结合。
+
+最终机制链应写成：
+
+```text
+内部表示/采样行为
+    -> 边界信号
+    -> known / uncertain / no_access / stale
+    -> answer / retrieve / clarify / abstain
+    -> 证据使用、冲突裁决和最终风险
+```
+
 ## 6. 材料科学评测基准
 
 首个受控领域是材料科学，使用 Materials Project 的版本化结构化记录作为权威来源。原始数据、API 密钥和向量索引只保存在本地或对象存储中，仓库只保存 manifest、字段映射和生成配置。
@@ -356,6 +438,79 @@ context_tokens, output_tokens, latency_ms, failure_label
 | [Mitigating LLM Hallucinations via Conformal Abstention](https://arxiv.org/abs/2405.01563), Yadkori et al., 2024 | 用采样相似度和 conformal 校准控制幻觉风险与拒答率。 |
 | [The Materials Project](https://doi.org/10.1063/1.4812323), Jain et al., 2013 | 提供可版本化、可脚本比对的材料属性来源。 |
 | [SciQAG](https://arxiv.org/abs/2405.09939), Wan et al., 2024 | 支持自动生成科学问答和细粒度评测，但本项目用确定性属性评测替代开放式 LLM 判定。 |
+| [Fine Tuning vs. Retrieval Augmented Generation for Less Popular Knowledge](https://arxiv.org/abs/2403.01432), Soudani, Kanoulas & Hasibi, 2024 | 直接比较低频知识上的 FT 与 RAG；报告低频实体上 RAG 通常优于 FT，并提出 Stimulus RAG。作为本项目长尾材料实验的核心对照。 |
+| [LLM Internal States Reveal Hallucination Risk Faced With a Query](https://arxiv.org/abs/2407.03282), Ji et al., 2024 | 用内部层、神经元和 token 状态在生成前估计 hallucination risk，支持本项目的 probe-based boundary signals。 |
+| [The Geometry of Truth](https://arxiv.org/abs/2310.06824), Marks & Tegmark, 2023 | 通过表示可视化、跨数据集 transfer 和 forward-pass 干预研究真假方向；支持本项目从相关 probe 走向因果干预。 |
+| [Semantic Entropy Probes](https://arxiv.org/abs/2406.15927), Kossen et al., 2024 | 用单次隐藏状态近似 semantic entropy，降低多次采样成本；同时提示 layer/token 选择和 OOD 泛化需要单独评测。 |
+| [From Signals to Transfer](https://arxiv.org/abs/2606.27679), Srey et al., 2026 | 在 matched 条件下拆分 probe 特征、标签和评测设置，发现 raw hidden states 域内强但结构化特征在分布偏移下更稳。 |
+| [CORVUS](https://arxiv.org/abs/2601.14310), Min et al., 2026 | 通过内部信号 camouflage 攻击 hallucination detector，说明单一 hidden-state detector 不能作为充分解释。 |
+| [Tuned Lens](https://arxiv.org/abs/2303.08112), Belrose et al., 2023 | 逐层解码 latent predictions，并用因果实验分析层间预测轨迹；可作为本项目层级动态分析工具。 |
+| [Locating and Editing Factual Associations in GPT](https://arxiv.org/abs/2202.05262), Meng et al., 2022 | 用 causal tracing 定位事实记忆的中间层计算，并通过编辑验证因果性；可用于 known/stale 记忆干预设计。 |
+| [Why Semantic Entropy Fails](https://arxiv.org/abs/2605.21801), Zhang et al., 2026 | 从几何和 gradient variance 解释语义熵失效，提示不确定性信号需要和优化动态、校准及学习信号质量对齐。 |
+| [LLMs can learn self-restraint through iterative self-reflection](https://arxiv.org/abs/2405.13022), Piché et al., 2024 | 用自评估和 utility 训练模型学会 abstain；作为拒答训练路线的对照，不等同于本项目的后验门控。 |
+| [Know2Guess](https://arxiv.org/abs/2606.26101), Meng et al., 2026 | contamination-aware、多区域 knowledge-boundary benchmark，分离 answer、unknown、abstention 和 generic refusal。作为四状态评测设计参考。 |
+| [Interpretable Uncertainty for Adaptive Retrieval and Reasoning in Question Answering](https://arxiv.org/abs/2607.07380), Dey, Ounis & McDonald, 2026 | 从内部表示区分 knowledge insufficiency 与 ambiguity/conflict，并据此触发检索或额外推理，是当前最接近的可解释门控工作之一。 |
+| [Know Before You Fetch](https://arxiv.org/abs/2606.29959), Dong et al., 2026 | 将 adaptive RAG 形式化为 calibrated retrieval-budget allocation，在 closed-book、不同 k 和 abstain 间分配预算。支持本项目的 Pareto frontier 设计。 |
+| [When Should Active RAG Retrieve?](https://arxiv.org/abs/2607.24010), Qian et al., 2026 | 强调实际 retrieval usage、预算迁移误差、harm rate、成本分解和 utility frontier，不能只报告 accuracy。 |
+| [Trust or Abstain? A Self-Aware RAG Approach](https://arxiv.org/abs/2605.18792), Zhu et al., 2026 | SABER 在 PK/CK 冲突下做 trust-PK、trust-CK、trust-either、abstain 四格决策；与本项目冲突裁决和拒答最接近。 |
+| [GRACE](https://arxiv.org/abs/2601.04525), Zhao et al., 2026 | 用强化学习同时学习 grounded response 和 evidence-insufficient abstention；作为训练型拒答基线。 |
+| [Geometry-Calibrated Conformal Abstention](https://arxiv.org/abs/2604.27914), Xu et al., 2026 | 用表示几何校准 conformal abstention，提供 coverage/correctness 约束；作为后验统计拒答基线。 |
+
+其中 2026 年条目目前按 arXiv 预印本记录，复现时要区分“方法启发”和“已验证结论”。本项目不会把这些论文的结果直接移植到材料科学数据上。
+
+## 13.1 Baseline 复现协议
+
+可运行基线代码集中在 `baselines/`，主实验通过 `scripts/run_e2e.py` 的参数选择基线。所有基线必须使用同一模型、语料、问题集合、prompt、probe budget、candidate top-k、最终 top-k 和时延统计。
+
+路由基线：
+
+```text
+always-answer
+always-rag
+uncalibrated-confidence
+calibrated-boundary-gate
+```
+
+需要额外训练或校准后才能运行的入口：
+
+```text
+complexity-classifier-router
+conformal-abstention
+```
+
+仅作探索性 proxy、不能写成论文方法复现：
+
+```text
+complexity-heuristic
+```
+
+冲突基线：
+
+```text
+trust-parameter
+trust-retrieval
+majority-rule
+claim-level
+```
+
+复现实验配置见 `configs/baselines.yaml`。推荐命名：
+
+```text
+results/runs/e2e-<routing-baseline>-<conflict-baseline>-<timestamp>/
+```
+
+记录至少包括 `summary.json`、`results.jsonl`、`probes.jsonl`、`registry.json` 和 `PROBES.md`。训练型论文方法（例如 Self-RAG、GRACE、SABER）只有在实现其训练/校准过程后，才能标记为 reproduced；当前仓库先提供严格推理基线和明确标注的待实现接口。
+
+示例：
+
+```powershell
+python scripts/run_e2e.py --n 30 --corpus 8000 `
+  --routing-baseline always-rag `
+  --conflict-baseline trust-retrieval `
+  --run-id e2e-always-rag-trust-retrieval-001
+```
+
+四组合 encoder/reranker 只通过 `RAG_ENCODER_PATH`、`RAG_RERANKER_PATH`、`RAG_ENCODER_TYPE` 和 `RAG_RERANKER_TYPE` 替换，基线策略和模型组合可以正交交叉。
 
 ## 14. 目录结构
 
@@ -365,7 +520,15 @@ context_tokens, output_tokens, latency_ms, failure_label
 ├── .gitignore
 ├── pyproject.toml
 ├── configs/
-│   └── base.yaml
+│   ├── base.yaml
+│   ├── baselines.yaml
+│   ├── interpretability_probe.yaml
+│   ├── bge_m3_train.yaml
+│   └── bge_reranker_train.yaml
+├── baselines/
+│   ├── policies.py
+│   ├── conflicts.py
+│   └── registry.py
 ├── data/
 │   ├── raw/
 │   ├── interim/
@@ -373,7 +536,10 @@ context_tokens, output_tokens, latency_ms, failure_label
 │   └── external/
 ├── notebooks/
 ├── scripts/
+│   ├── build_boundary_benchmark.py
+│   ├── analyze_probe_runs.py
 │   ├── download_models.py
+│   ├── run_e2e.py
 │   └── run_bge_smoke.py
 ├── src/
 │   └── self_knowledge_gating/
@@ -381,6 +547,7 @@ context_tokens, output_tokens, latency_ms, failure_label
 │       ├── signals.py
 │       ├── policy.py
 │       ├── retrieval.py
+│       ├── retrieval_components.py
 │       ├── bge_retrieval.py
 │       ├── generation.py
 │       ├── verification.py
@@ -396,6 +563,7 @@ context_tokens, output_tokens, latency_ms, failure_label
 目录职责：
 
 - `configs/base.yaml`：四状态、四动作、材料切片、校准、冲突和 Pareto 维度的无密钥基线配置；
+- `baselines/`：与主 Pipeline 契约兼容的路由和冲突复现基线；
 - `data/`：原始、处理中间、可读取数据和外部语料分层，真实内容默认不提交；
 - `src/`：数据契约、信号估计、校准、检索接口、冲突裁决、门控策略和评测实现；
 - `scripts/`：数据准备、运行实验、评测和结果汇总入口；
@@ -420,6 +588,59 @@ python -m venv .venv
 - `ConflictAdjudicator`：接入更强的来源可靠性、时间和冲突裁决器。
 
 `SelfKnowledgeGatingPipeline.run()` 是统一编排入口。它把“路由动作”和“最终结果”分开记录：检索路由成功后，最终结果是 `answer`；检索失败或冲突未解决时，最终结果是 `abstain`。
+
+## 15.1 可替换 Encoder / Reranker 接口
+
+检索编排不绑定某一组模型。`ComposableRetriever` 接收两个独立组件：
+
+```text
+DenseEncoder.encode(texts) -> matrix[n_documents, embedding_dim]
+PairReranker.score(query, passages) -> scores[n_passages]
+```
+
+仓库内置四个适配器：
+
+| 类型 | Encoder | Reranker |
+| --- | --- | --- |
+| `flag_embedding` | `BGEM3FlagModel`，适合 BGE-M3 | `FlagReranker`，适合 bge-reranker-v2-m3 |
+| `transformers` | `AutoModel`，支持 CLS/mean pooling | `AutoModelForSequenceClassification` |
+
+因此可以独立替换 encoder 或 reranker：
+
+```python
+from self_knowledge_gating.bge_retrieval import ComposableRetriever
+
+retriever = ComposableRetriever.from_model_paths(
+    encoder_path="models/finetuned/bge-m3-matsci-v1-seed42",
+    reranker_path="models/finetuned/bge-reranker-v2-m3-matsci-v1-seed42",
+    encoder_type="flag_embedding",
+    reranker_type="flag_embedding",
+    corpus=corpus,
+    candidate_top_k=40,
+    final_top_k=5,
+)
+```
+
+也可以把任意实现了 `encode` 和 `score` 的自定义对象直接传给 `ComposableRetriever(encoder=..., reranker=...)`。检索结果会在 metadata 中记录实际 encoder/reranker 名称，方便四组合实验审计。
+
+远程网页服务 `scripts/rag_server.py` 通过环境变量选择组合，网页端无需修改：
+
+```text
+RAG_ENCODER_PATH
+RAG_RERANKER_PATH
+RAG_ENCODER_TYPE=flag_embedding|transformers
+RAG_RERANKER_TYPE=flag_embedding|transformers
+RAG_ENCODER_DEVICE=auto|cuda|cpu
+RAG_RERANKER_DEVICE=auto|cuda|cpu
+RAG_ENCODER_PRECISION=auto|bf16|fp16|fp32
+RAG_RERANKER_PRECISION=auto|bf16|fp16|fp32
+RAG_ENCODER_POOLING=cls|mean
+RAG_ENCODER_QUERY_PREFIX
+RAG_CANDIDATE_TOP_K
+RAG_FINAL_TOP_K
+```
+
+本地 `rag-platform` 只负责通过 SSH 隧道代理 `/chat`，不保存模型权重；`config.local.json` 只放本机 SSH 密码并由 `.gitignore` 排除，不提交到仓库。
 
 ## 16. 大规模 BGE 训练与测试
 
@@ -496,10 +717,15 @@ Reranker 微调使用同一批材料科学 query 的正例和 hard negatives，�
 - [ ] 接入可替换检索器并记录证据快照。
 - [ ] 实现声明级证据检查、冲突裁决和失败归因。
 - [ ] 实现 reason-coded abstention 和权限泄露 canary。
+- [ ] 完成信号层：P(IK)、P(True)、semantic entropy、sampling consistency、logprob 的校准与 OOD 评测。
+- [ ] 完成表示层：layer/token hidden-state probe、Tuned Lens 和跨任务迁移。
+- [ ] 完成因果层：activation patching、ablation、steering 和 known/stale/no-access 干预。
+- [ ] 记录训练动态：gradient norm、update direction、Fisher/参数重要性和微调前后边界变化。
+- [ ] 完成非平稳性分析：prompt、temperature、context order、版本漂移和 repeated-run variance。
 - [ ] 扫描预算并生成 Pareto frontier。
 - [ ] 在固定 reranker/LLM/prompt 下报告引用支持率、无答案拒答正确率和 badcase 率。
 - [ ] 完成消融、机制分析和可复现实验汇总。
 
-## 18. License
+## 19. License
 
 许可证尚未确定。公开发布前根据代码来源、数据许可和模型服务条款补充许可证文件。
